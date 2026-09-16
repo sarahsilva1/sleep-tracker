@@ -40,6 +40,14 @@ npm run build   # type-checked production build to dist/
 npm run check   # svelte-check + tsc only
 ```
 
+## Deployment
+
+Pushing to `main` (or this repo's working branch) builds and deploys to
+GitHub Pages automatically via `.github/workflows/deploy.yml`. One-time
+setup: in the repo's **Settings → Pages**, set **Source** to **GitHub
+Actions**. The app will then be live at
+`https://<owner>.github.io/sleep-tracker/`.
+
 ## Data model
 
 - **Child**: id, name, date of birth
