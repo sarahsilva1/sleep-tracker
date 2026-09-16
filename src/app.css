@@ -1,0 +1,153 @@
+:root {
+  --bg: #211a15;
+  --bg-elevated: #2a2119;
+  --surface: #33281f;
+  --surface-2: #3d3025;
+  --border: #4a3c2e;
+
+  --text: #f3e9dc;
+  --text-muted: #b7a795;
+  --text-faint: #8a7a68;
+
+  --accent: #d98554;
+  --accent-strong: #e6935f;
+  --accent-text: #2a1810;
+
+  --asleep: #5c7a5e;
+  --awake: #d9a441;
+  --danger: #c05b46;
+
+  --radius-lg: 20px;
+  --radius-md: 14px;
+  --radius-sm: 9px;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    system-ui,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior-y: none;
+}
+
+#app {
+  max-width: 480px;
+  margin: 0 auto;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+button {
+  font-family: inherit;
+  border: none;
+  cursor: pointer;
+  color: inherit;
+}
+
+input,
+textarea {
+  font-family: inherit;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+
+input:focus,
+textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.card {
+  background: var(--surface);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+}
+
+.pill {
+  border-radius: 999px;
+  padding: 8px 16px;
+  background: var(--surface);
+  color: var(--text-muted);
+}
+
+.pill.active {
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-radius: var(--radius-md);
+  font-weight: 700;
+  font-size: 1.1rem;
+  padding: 18px;
+}
+
+.btn-primary.active {
+  background: var(--asleep);
+  color: var(--text);
+}
+
+.btn-secondary {
+  background: var(--surface-2);
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+}
+
+.btn-icon {
+  background: var(--surface);
+  border-radius: 999px;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 6px;
+}
+.status-dot.asleep {
+  background: var(--asleep);
+}
+.status-dot.awake {
+  background: var(--awake);
+}
+
+.muted {
+  color: var(--text-muted);
+}
+.faint {
+  color: var(--text-faint);
+}
