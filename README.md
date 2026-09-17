@@ -20,18 +20,23 @@ npm run dev
 
 The app works with zero configuration — data stays on-device in IndexedDB.
 
-## Enabling sync between caregivers (optional)
+## Sync between caregivers
 
-1. Create a free [Supabase](https://supabase.com) project.
-2. In the SQL editor, run `supabase/schema.sql`.
-3. In **Authentication → Settings**, enable **Allow anonymous sign-ins**.
-4. Copy `.env.example` to `.env.local` and fill in your project's URL and anon key.
-5. Restart the dev server. In **Settings** in the app, tap **Create sync
-   code** on the first device, and enter that code on the second device to
-   join the same family.
+Sync is backed by a Supabase project with `supabase/schema.sql` applied and
+anonymous sign-ins enabled. The project URL and anon key are checked into
+`src/lib/supabaseClient.ts` as defaults — this is safe because the anon key
+is designed to be public; Row Level Security in `schema.sql` is what
+actually restricts access, not secrecy of that key.
 
-The setup code is a one-time secret used only to link a device to a family —
-it's never embedded in a shareable link and is never stored in plaintext.
+In **Settings** in the app, tap **Create sync code** on the first device,
+and enter that code on the second device to join the same family. The code
+is a one-time secret used only to link a device to a family — it's never
+embedded in a shareable link and is never stored in plaintext.
+
+To point the app at a different Supabase project (e.g. for local dev
+against your own instance), copy `.env.example` to `.env.local` and set
+`VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` — these override the
+checked-in defaults.
 
 ## Build
 
@@ -42,10 +47,14 @@ npm run check   # svelte-check + tsc only
 
 ## Deployment
 
-Pushing to `main` (or this repo's working branch) builds and deploys to
-GitHub Pages automatically via `.github/workflows/deploy.yml`. One-time
-setup: in the repo's **Settings → Pages**, set **Source** to **GitHub
-Actions**. The app will then be live at
+Deployed as a Cloudflare Worker with static assets (`wrangler.jsonc` points
+it at the `dist/` build output), connected to this repo via Cloudflare's
+Git integration — pushes to the tracked branch rebuild and redeploy
+automatically.
+
+A GitHub Pages workflow (`.github/workflows/deploy.yml`) is also available
+as an alternate/backup deploy target; it needs **Settings → Pages → Source:
+GitHub Actions** enabled on the repo, and serves from
 `https://<owner>.github.io/sleep-tracker/`.
 
 ## Data model
