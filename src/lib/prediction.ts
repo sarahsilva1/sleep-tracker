@@ -1,24 +1,9 @@
 import type { Child, SleepSession, SleepSlot } from "./types";
 
-// --- 1. Age-based baseline (minutes), using the midpoint of each range ---
-
-interface AgeBaseline {
-  maxAgeMonths: number; // upper bound, exclusive (Infinity for the last bracket)
-  wakeWindowMinutes: number; // midpoint of the spec'd range
-}
-
-const AGE_BASELINES: AgeBaseline[] = [
-  { maxAgeMonths: 2, wakeWindowMinutes: 52.5 }, // 0-2mo: 45-60min
-  { maxAgeMonths: 3, wakeWindowMinutes: 75 }, // 2-3mo: 60-90min
-  { maxAgeMonths: 4, wakeWindowMinutes: 105 }, // 3-4mo: 1.5-2hr
-  { maxAgeMonths: 6, wakeWindowMinutes: 135 }, // 4-6mo: 2-2.5hr
-  { maxAgeMonths: 9, wakeWindowMinutes: 180 }, // 6-9mo: 2.5-3.5hr
-  { maxAgeMonths: 12, wakeWindowMinutes: 210 }, // 9-12mo: 3-4hr
-  { maxAgeMonths: 18, wakeWindowMinutes: 270 }, // 12-18mo: 4-5hr
-  { maxAgeMonths: Infinity, wakeWindowMinutes: 330 }, // 18+mo: 5-6hr
-];
-
 const AVG_DAYS_PER_MONTH = 30.4375;
+const ROLLING_WINDOW_DAYS = 14;
+const HALF_LIFE_DAYS = 5; // recency decay: an observation this many days old counts half as much
+const GUARDRAIL_FACTOR = 0.4; // clamp to within +/-40% of the age baseline
 
 export function ageInMonths(dateOfBirth: string, atDate: Date): number {
   const dob = new Date(dateOfBirth + "T00:00:00");
@@ -26,96 +11,174 @@ export function ageInMonths(dateOfBirth: string, atDate: Date): number {
   return Math.max(0, days / AVG_DAYS_PER_MONTH);
 }
 
-export function ageBaselineMinutes(ageMonths: number): number {
-  const bracket = AGE_BASELINES.find((b) => ageMonths < b.maxAgeMonths);
-  return (bracket ?? AGE_BASELINES[AGE_BASELINES.length - 1]).wakeWindowMinutes;
-}
-
-// --- 2. Per-time-slot classification ---
-//
-// Slot is assigned by ordinal position among a child's sleep sessions that
-// started on the same local calendar day: the 1st sleep of the day is
-// "nap1", 2nd is "nap2", 3rd is "nap3", and a 4th+ is "bedtime". This is a
-// simple approximation, not a lookahead-based "is this actually the last
-// sleep of the day" classification — for a one-nap toddler, the true
-// bedtime sleep will be labeled "nap2". That's an accepted tradeoff: the
-// same rule is applied consistently when both recording history and
-// predicting the next slot, so personal averages stay self-consistent even
-// though the label doesn't always match what a human would call it.
-function ordinalToSlot(priorSessionsToday: number): SleepSlot {
-  if (priorSessionsToday === 0) return "nap1";
-  if (priorSessionsToday === 1) return "nap2";
-  if (priorSessionsToday === 2) return "nap3";
-  return "bedtime";
-}
-
-function localDateKey(iso: string): string {
-  const d = new Date(iso);
+function localDateKey(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
-interface WakeWindowObservation {
-  slot: SleepSlot;
-  minutes: number;
-  observedAt: Date; // the start time of the sleep session that ended this wake window
-  excluded: boolean;
+// --- Sleep classification: night sleep vs. naps, via each child's own bedtime/wake window ---
+
+export function timeStringToMinutes(hhmm: string): number {
+  const [h, m] = hhmm.split(":").map(Number);
+  return h * 60 + m;
 }
 
-/** Derives one wake-window observation per sleep session that has a preceding, ended session. */
-function computeWakeWindowObservations(sessions: SleepSession[]): WakeWindowObservation[] {
-  const sorted = [...sessions]
-    .filter((s) => !s.deleted)
-    .sort((a, b) => a.startTime.localeCompare(b.startTime));
+function minutesOfDay(d: Date): number {
+  return d.getHours() * 60 + d.getMinutes();
+}
 
-  const observations: WakeWindowObservation[] = [];
-  const sessionsTodayCount = new Map<string, number>();
+function isNightTime(minutes: number, bedtimeMinutes: number, wakeMinutes: number): boolean {
+  if (bedtimeMinutes > wakeMinutes) {
+    // Typical case: the night window wraps past midnight (e.g. 19:30 -> 06:30).
+    return minutes >= bedtimeMinutes || minutes < wakeMinutes;
+  }
+  // Unusual configuration (bedtime numerically before wake time) — treat as non-wrapping.
+  return minutes >= bedtimeMinutes && minutes < wakeMinutes;
+}
 
-  for (let i = 0; i < sorted.length; i++) {
-    const session = sorted[i];
-    const dayKey = localDateKey(session.startTime);
-    const priorToday = sessionsTodayCount.get(dayKey) ?? 0;
-    const slot = ordinalToSlot(priorToday);
-    sessionsTodayCount.set(dayKey, priorToday + 1);
+/** A session is night sleep if it *starts* within the child's bedtime->wake-time window. */
+export function isNightSession(session: SleepSession, child: Child): boolean {
+  const bedtimeMinutes = timeStringToMinutes(child.typicalBedtime);
+  const wakeMinutes = timeStringToMinutes(child.typicalWakeTime);
+  return isNightTime(minutesOfDay(new Date(session.startTime)), bedtimeMinutes, wakeMinutes);
+}
 
-    const prev = sorted[i - 1];
-    if (prev && prev.endTime) {
-      const minutes = (new Date(session.startTime).getTime() - new Date(prev.endTime).getTime()) / 60000;
-      if (minutes > 0) {
-        observations.push({
-          slot,
-          minutes,
-          observedAt: new Date(session.startTime),
-          excluded: session.excluded,
-        });
-      }
+/**
+ * The calendar day a night session's *night* belongs to: a session starting
+ * before the child's typical wake time is an early-morning continuation of
+ * the previous night (e.g. a 1am resumption after a waking still belongs to
+ * the night before). Naps don't need this — they never wrap midnight.
+ */
+function nightKeyFor(startTimeIso: string, wakeMinutes: number): string {
+  const d = new Date(startTimeIso);
+  if (minutesOfDay(d) < wakeMinutes) {
+    return localDateKey(new Date(d.getTime() - 24 * 60 * 60 * 1000));
+  }
+  return localDateKey(d);
+}
+
+/** The day a session should be grouped under for review/exclusion/trends purposes. */
+export function dayKeyForSession(session: SleepSession, child: Child): string {
+  if (isNightSession(session, child)) {
+    return nightKeyFor(session.startTime, timeStringToMinutes(child.typicalWakeTime));
+  }
+  return localDateKey(new Date(session.startTime));
+}
+
+function ordinalToNapSlot(index: number): SleepSlot {
+  const capped = Math.min(Math.max(index, 0), 3);
+  return (["nap1", "nap2", "nap3", "nap4"] as const)[capped];
+}
+
+/** Assigns each session a slot: naps are numbered by order within their day, capped at nap4; any night session is "bedtime". */
+export function classifySessions(sortedSessions: SleepSession[], child: Child): Map<string, SleepSlot> {
+  const slotBySessionId = new Map<string, SleepSlot>();
+  const napsCountByDay = new Map<string, number>();
+  for (const session of sortedSessions) {
+    if (isNightSession(session, child)) {
+      slotBySessionId.set(session.id, "bedtime");
+    } else {
+      const dayKey = localDateKey(new Date(session.startTime));
+      const priorToday = napsCountByDay.get(dayKey) ?? 0;
+      slotBySessionId.set(session.id, ordinalToNapSlot(priorToday));
+      napsCountByDay.set(dayKey, priorToday + 1);
     }
   }
-
-  return observations;
+  return slotBySessionId;
 }
 
-// --- 3. Personal average (rolling 14-day, recency-weighted, outlier-excluded) ---
+// --- Age-based baselines ---
 
-const ROLLING_WINDOW_DAYS = 14;
-const HALF_LIFE_DAYS = 5; // recency decay: a wake window this many days old counts half as much
+interface AgeBracket<T> {
+  maxAgeMonths: number; // upper bound, exclusive (Infinity for the last bracket)
+  value: T;
+}
+
+function lookupBracket<T>(brackets: AgeBracket<T>[], ageMonths: number): T {
+  const bracket = brackets.find((b) => ageMonths < b.maxAgeMonths);
+  return (bracket ?? brackets[brackets.length - 1]).value;
+}
+
+// Wake window (time spent awake before the next sleep), minutes, midpoint of each spec'd range.
+const WAKE_WINDOW_BASELINES: AgeBracket<number>[] = [
+  { maxAgeMonths: 2, value: 52.5 }, // 45-60min
+  { maxAgeMonths: 3, value: 75 }, // 60-90min
+  { maxAgeMonths: 4, value: 105 }, // 1.5-2hr
+  { maxAgeMonths: 6, value: 135 }, // 2-2.5hr
+  { maxAgeMonths: 9, value: 180 }, // 2.5-3.5hr
+  { maxAgeMonths: 12, value: 210 }, // 3-4hr
+  { maxAgeMonths: 18, value: 270 }, // 4-5hr
+  { maxAgeMonths: 24, value: 330 }, // 5-6hr
+  { maxAgeMonths: 30, value: 360 }, // 5.5-6.5hr
+  { maxAgeMonths: 36, value: 390 }, // 6-7hr
+  { maxAgeMonths: Infinity, value: 390 }, // 6-7hr, typically bedtime-only
+];
+
+export function ageBaselineMinutes(ageMonths: number): number {
+  return lookupBracket(WAKE_WINDOW_BASELINES, ageMonths);
+}
+
+// Night sleep duration baseline (total across the night), minutes.
+const NIGHT_DURATION_BASELINES: AgeBracket<number>[] = [
+  { maxAgeMonths: 2, value: 510 }, // ~8.5hr
+  { maxAgeMonths: 4, value: 570 }, // ~9.5hr
+  { maxAgeMonths: 6, value: 630 }, // ~10.5hr
+  { maxAgeMonths: 12, value: 660 }, // ~11hr
+  { maxAgeMonths: 24, value: 690 }, // ~11.5hr
+  { maxAgeMonths: 36, value: 660 }, // ~11hr
+  { maxAgeMonths: Infinity, value: 630 }, // ~10.5hr
+];
+
+// Nap duration baseline (a single typical nap), minutes, before per-slot adjustment below.
+// The spec gives illustrative examples (nap1 ~60-90min, nap2 ~45-60min) rather than a full
+// table; this approximates that pattern across ages rather than reproducing exact figures.
+const NAP_DURATION_BASELINES: AgeBracket<number>[] = [
+  { maxAgeMonths: 4, value: 60 },
+  { maxAgeMonths: 9, value: 75 },
+  { maxAgeMonths: 18, value: 75 },
+  { maxAgeMonths: 36, value: 105 },
+  { maxAgeMonths: Infinity, value: 90 },
+];
+
+const NAP_SLOT_ADJUSTMENT_MINUTES: Record<string, number> = {
+  nap1: 15,
+  nap2: 0,
+  nap3: -15,
+  nap4: -20,
+};
+
+const MIN_NAP_DURATION_MINUTES = 20;
+
+function durationBaselineMinutes(ageMonths: number, slot: SleepSlot): number {
+  if (slot === "bedtime") return lookupBracket(NIGHT_DURATION_BASELINES, ageMonths);
+  const base = lookupBracket(NAP_DURATION_BASELINES, ageMonths);
+  return Math.max(MIN_NAP_DURATION_MINUTES, base + NAP_SLOT_ADJUSTMENT_MINUTES[slot]);
+}
+
+// --- Shared rolling/recency-weighted average, outlier exclusion, blend, guardrail ---
+
+interface Observation {
+  slot: SleepSlot;
+  minutes: number;
+  observedAt: Date;
+  excluded: boolean;
+}
 
 function recencyWeight(ageDays: number): number {
   return Math.pow(0.5, ageDays / HALF_LIFE_DAYS);
 }
 
-interface PersonalAverageResult {
+interface AverageResult {
   minutes: number | null;
   daysOfData: number;
 }
 
 function personalAverageForSlot(
-  observations: WakeWindowObservation[],
+  observations: Observation[],
   slot: SleepSlot,
-  ageBaseline: number,
+  outlierBaseline: number,
   now: Date,
-): PersonalAverageResult {
+): AverageResult {
   const windowStart = now.getTime() - ROLLING_WINDOW_DAYS * 24 * 60 * 60 * 1000;
-
   const daysWithAnyData = new Set<string>();
   let weightedSum = 0;
   let weightTotal = 0;
@@ -125,10 +188,10 @@ function personalAverageForSlot(
     if (t < windowStart || t > now.getTime()) continue;
     if (obs.excluded) continue;
 
-    daysWithAnyData.add(localDateKey(obs.observedAt.toISOString()));
+    daysWithAnyData.add(localDateKey(obs.observedAt));
 
     if (obs.slot !== slot) continue;
-    if (obs.minutes < 10 || obs.minutes > 2 * ageBaseline) continue; // implausible outlier
+    if (obs.minutes < 10 || obs.minutes > 2 * outlierBaseline) continue;
 
     const ageDays = (now.getTime() - t) / (1000 * 60 * 60 * 24);
     const weight = recencyWeight(ageDays);
@@ -136,13 +199,8 @@ function personalAverageForSlot(
     weightTotal += weight;
   }
 
-  return {
-    minutes: weightTotal > 0 ? weightedSum / weightTotal : null,
-    daysOfData: daysWithAnyData.size,
-  };
+  return { minutes: weightTotal > 0 ? weightedSum / weightTotal : null, daysOfData: daysWithAnyData.size };
 }
-
-// --- 4. Blend weighting ---
 
 function blendWeights(daysOfData: number): { personal: number; baseline: number } {
   if (daysOfData >= 14) return { personal: 0.9, baseline: 0.1 };
@@ -151,9 +209,17 @@ function blendWeights(daysOfData: number): { personal: number; baseline: number 
   return { personal: 0.2, baseline: 0.8 };
 }
 
-// --- 5 & 6. Guardrail + final prediction ---
+function blendAndClamp(personalMinutes: number | null, baseline: number, daysOfData: number): number {
+  const weights = blendWeights(daysOfData);
+  const blended = personalMinutes !== null ? personalMinutes * weights.personal + baseline * weights.baseline : baseline;
+  const min = baseline * (1 - GUARDRAIL_FACTOR);
+  const max = baseline * (1 + GUARDRAIL_FACTOR);
+  return Math.min(max, Math.max(min, blended));
+}
 
-export interface SweetSpotPrediction {
+// --- Algorithm A: wind-down time (when to put them down next) ---
+
+export interface WindDownPrediction {
   slot: SleepSlot;
   wakeWindowMinutes: number;
   predictedTime: Date;
@@ -161,62 +227,155 @@ export interface SweetSpotPrediction {
   daysOfData: number;
 }
 
-export function predictNextSleep(
+function computeWakeWindowObservations(sortedSessions: SleepSession[], child: Child): Observation[] {
+  const slotBySessionId = classifySessions(sortedSessions, child);
+  const observations: Observation[] = [];
+  for (let i = 1; i < sortedSessions.length; i++) {
+    const session = sortedSessions[i];
+    const prev = sortedSessions[i - 1];
+    if (!prev.endTime) continue;
+    const minutes = (new Date(session.startTime).getTime() - new Date(prev.endTime).getTime()) / 60000;
+    if (minutes <= 0) continue;
+    observations.push({
+      slot: slotBySessionId.get(session.id)!,
+      minutes,
+      observedAt: new Date(session.startTime),
+      excluded: session.excluded,
+    });
+  }
+  return observations;
+}
+
+export function predictWindDown(
   child: Child,
   sessions: SleepSession[],
-  overrides: Map<SleepSlot, number>,
   now: Date = new Date(),
-): SweetSpotPrediction | null {
-  const relevant = sessions.filter((s) => s.childId === child.id && !s.deleted);
-  const sorted = [...relevant].sort((a, b) => a.startTime.localeCompare(b.startTime));
+): WindDownPrediction | null {
+  const sorted = sessions
+    .filter((s) => s.childId === child.id && !s.deletedAt)
+    .sort((a, b) => a.startTime.localeCompare(b.startTime));
 
-  // Find the last wake-up: the end time of the most recent finished session,
-  // or now, if a session is currently running (no prediction while asleep).
   const running = sorted.find((s) => s.endTime === null);
-  if (running) return null;
+  if (running) return null; // no wind-down prediction while asleep — see predictEstimatedWake instead
 
   const lastFinished = [...sorted].reverse().find((s) => s.endTime !== null);
-  if (!lastFinished || !lastFinished.endTime) return null;
+  if (!lastFinished?.endTime) return null;
 
   const lastWakeUpTime = new Date(lastFinished.endTime);
-  const dayKey = localDateKey(lastWakeUpTime.toISOString());
-  const sessionsStartedSameDay = sorted.filter(
-    (s) => localDateKey(s.startTime) === dayKey && s.startTime <= lastFinished.startTime,
+  const todayKey = localDateKey(lastWakeUpTime);
+  const napsSoFarToday = sorted.filter(
+    (s) => !isNightSession(s, child) && localDateKey(new Date(s.startTime)) === todayKey,
   ).length;
-  const slot = ordinalToSlot(sessionsStartedSameDay - 1);
+
+  const slot: SleepSlot = napsSoFarToday < child.typicalNapCount ? ordinalToNapSlot(napsSoFarToday) : "bedtime";
 
   const ageMonths = ageInMonths(child.dateOfBirth, now);
   const baseline = ageBaselineMinutes(ageMonths);
 
-  if (overrides.has(slot)) {
-    const minutes = overrides.get(slot)!;
-    return {
-      slot,
-      wakeWindowMinutes: minutes,
-      predictedTime: new Date(lastWakeUpTime.getTime() + minutes * 60000),
-      lastWakeUpTime,
-      daysOfData: 0,
-    };
-  }
-
-  const observations = computeWakeWindowObservations(sorted);
+  const observations = computeWakeWindowObservations(sorted, child);
   const { minutes: personalMinutes, daysOfData } = personalAverageForSlot(observations, slot, baseline, now);
-  const weights = blendWeights(daysOfData);
-
-  const blended =
-    personalMinutes !== null
-      ? personalMinutes * weights.personal + baseline * weights.baseline
-      : baseline;
-
-  const min = baseline * 0.6;
-  const max = baseline * 1.4;
-  const clamped = Math.min(max, Math.max(min, blended));
+  const wakeWindowMinutes = blendAndClamp(personalMinutes, baseline, daysOfData);
 
   return {
     slot,
-    wakeWindowMinutes: clamped,
-    predictedTime: new Date(lastWakeUpTime.getTime() + clamped * 60000),
+    wakeWindowMinutes,
+    predictedTime: new Date(lastWakeUpTime.getTime() + wakeWindowMinutes * 60000),
     lastWakeUpTime,
     daysOfData,
   };
+}
+
+// --- Algorithm B: estimated wake time (while asleep) ---
+
+export interface EstimatedWakeRange {
+  slot: SleepSlot;
+  rangeStart: Date;
+  rangeEnd: Date;
+  daysOfData: number;
+}
+
+const DISPLAY_RANGE_FACTOR = 0.2; // +/-20% band around the point estimate, for display only
+
+export function predictEstimatedWake(
+  child: Child,
+  sessions: SleepSession[],
+  now: Date = new Date(),
+): EstimatedWakeRange | null {
+  const sorted = sessions
+    .filter((s) => s.childId === child.id && !s.deletedAt)
+    .sort((a, b) => a.startTime.localeCompare(b.startTime));
+
+  const running = sorted.find((s) => s.endTime === null);
+  if (!running) return null;
+
+  const slotBySessionId = classifySessions(sorted, child);
+  const slot = slotBySessionId.get(running.id)!;
+  const ageMonths = ageInMonths(child.dateOfBirth, now);
+
+  let outlierBaseline = durationBaselineMinutes(ageMonths, slot);
+
+  if (slot === "bedtime") {
+    const wakeMinutes = timeStringToMinutes(child.typicalWakeTime);
+    const nightKey = nightKeyFor(running.startTime, wakeMinutes);
+    const priorSegmentsMinutes = sorted
+      .filter(
+        (s) =>
+          s.id !== running.id &&
+          s.endTime &&
+          isNightSession(s, child) &&
+          nightKeyFor(s.startTime, wakeMinutes) === nightKey &&
+          s.startTime < running.startTime,
+      )
+      .reduce((sum, s) => sum + (new Date(s.endTime!).getTime() - new Date(s.startTime).getTime()) / 60000, 0);
+    outlierBaseline = Math.max(MIN_NAP_DURATION_MINUTES, outlierBaseline - priorSegmentsMinutes);
+  }
+
+  const durationObservations: Observation[] = [];
+  for (const session of sorted) {
+    if (!session.endTime || session.id === running.id) continue;
+    const minutes = (new Date(session.endTime).getTime() - new Date(session.startTime).getTime()) / 60000;
+    if (minutes <= 0) continue;
+    durationObservations.push({
+      slot: slotBySessionId.get(session.id)!,
+      minutes,
+      observedAt: new Date(session.startTime),
+      excluded: session.excluded,
+    });
+  }
+
+  const { minutes: personalMinutes, daysOfData } = personalAverageForSlot(
+    durationObservations,
+    slot,
+    outlierBaseline,
+    now,
+  );
+  const blended = blendAndClamp(personalMinutes, outlierBaseline, daysOfData);
+
+  const start = new Date(running.startTime);
+  const pointEstimate = start.getTime() + blended * 60000;
+  const halfBand = blended * DISPLAY_RANGE_FACTOR * 60000;
+
+  return {
+    slot,
+    rangeStart: new Date(pointEstimate - halfBand),
+    rangeEnd: new Date(pointEstimate + halfBand),
+    daysOfData,
+  };
+}
+
+// --- Trends helper: night sleep is the sum of segments within a night, not the outer span ---
+
+export function nightSleepTotalMinutes(sessions: SleepSession[], child: Child, nightDateKey: string): number {
+  const wakeMinutes = timeStringToMinutes(child.typicalWakeTime);
+  return sessions
+    .filter(
+      (s) =>
+        s.childId === child.id &&
+        !s.deletedAt &&
+        !s.excluded &&
+        s.endTime &&
+        isNightSession(s, child) &&
+        nightKeyFor(s.startTime, wakeMinutes) === nightDateKey,
+    )
+    .reduce((sum, s) => sum + (new Date(s.endTime!).getTime() - new Date(s.startTime).getTime()) / 60000, 0);
 }

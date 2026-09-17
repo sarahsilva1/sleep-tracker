@@ -1,14 +1,41 @@
 <script lang="ts">
   import { appState } from "./appState.svelte";
-  import { updateSleepSession, deleteSleepSession, getDayNote, setDayNote } from "./db";
+  import {
+    updateSleepSession,
+    softDeleteSession,
+    undoDeleteSession,
+    listRecentlyDeletedSessions,
+    getDayNote,
+    setDayNote,
+  } from "./db";
   import { buildDayTimeline } from "./timeline";
+  import { dayKeyForSession, classifySessions } from "./prediction";
   import TimelineBar from "./TimelineBar.svelte";
   import { fullSync } from "./sync";
+  import type { SleepSession, SleepSlot } from "./types";
 
   let { dateKey, onBack }: { dateKey: string; onBack: () => void } = $props();
 
   let noteText = $state("");
   let noteSaved = $state(true);
+  let recentlyDeleted = $state<SleepSession[]>([]);
+  let editingId = $state<string | null>(null);
+  let editStart = $state("");
+  let editEnd = $state("");
+
+  const SLOT_LABELS: Record<SleepSlot, string> = {
+    nap1: "Nap 1",
+    nap2: "Nap 2",
+    nap3: "Nap 3",
+    nap4: "Nap 4",
+    bedtime: "Bedtime",
+  };
+
+  async function refreshDeleted() {
+    if (appState.selectedChildId) {
+      recentlyDeleted = await listRecentlyDeletedSessions(appState.selectedChildId);
+    }
+  }
 
   $effect(() => {
     const childId = appState.selectedChildId;
@@ -17,12 +44,21 @@
       noteText = n?.text ?? "";
       noteSaved = true;
     });
+    refreshDeleted();
+    const interval = setInterval(refreshDeleted, 15000);
+    return () => clearInterval(interval);
   });
 
+  let slotBySessionId = $derived(
+    appState.selectedChild ? classifySessions(appState.selectedSessions, appState.selectedChild) : new Map(),
+  );
+
   let daySessions = $derived(
-    appState.selectedSessions
-      .filter((s) => localKey(s.startTime) === dateKey)
-      .sort((a, b) => a.startTime.localeCompare(b.startTime)),
+    appState.selectedChild
+      ? appState.selectedSessions
+          .filter((s) => dayKeyForSession(s, appState.selectedChild!) === dateKey)
+          .sort((a, b) => a.startTime.localeCompare(b.startTime))
+      : [],
   );
 
   let allExcluded = $derived(daySessions.length > 0 && daySessions.every((s) => s.excluded));
@@ -31,8 +67,9 @@
   let timelineUntil = $derived(new Date() < dayEnd ? new Date() : dayEnd);
   let timeline = $derived(buildDayTimeline(dateKey, appState.selectedSessions, timelineUntil));
 
-  function localKey(iso: string): string {
-    const d = new Date(iso);
+  function shiftDay(deltaDays: number): string {
+    const d = new Date(dateKey + "T00:00:00");
+    d.setDate(d.getDate() + deltaDays);
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   }
 
@@ -48,6 +85,12 @@
     return `${s} → ${e} (${dur})`;
   }
 
+  function toLocalInputValue(iso: string): string {
+    const d = new Date(iso);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
   async function toggleExcludeAll() {
     const childId = appState.selectedChildId;
     if (!childId) return;
@@ -59,19 +102,47 @@
     fullSync().catch(() => {});
   }
 
+  function startEdit(session: SleepSession) {
+    editingId = session.id;
+    editStart = toLocalInputValue(session.startTime);
+    editEnd = session.endTime ? toLocalInputValue(session.endTime) : "";
+  }
+
+  async function saveEdit(session: SleepSession) {
+    const childId = appState.selectedChildId;
+    if (!childId) return;
+    const patch: Partial<Pick<SleepSession, "startTime" | "endTime">> = {
+      startTime: new Date(editStart).toISOString(),
+    };
+    if (session.endTime) patch.endTime = new Date(editEnd).toISOString();
+    await updateSleepSession(session.id, patch);
+    await appState.loadSessions(childId);
+    editingId = null;
+    fullSync().catch(() => {});
+  }
+
   async function removeSession(id: string) {
     const childId = appState.selectedChildId;
     if (!childId) return;
-    if (!confirm("Delete this sleep entry?")) return;
-    await deleteSleepSession(id);
+    await softDeleteSession(id);
     await appState.loadSessions(childId);
+    await refreshDeleted();
+    fullSync().catch(() => {});
+  }
+
+  async function undoRemove(id: string) {
+    const childId = appState.selectedChildId;
+    if (!childId) return;
+    await undoDeleteSession(id);
+    await appState.loadSessions(childId);
+    await refreshDeleted();
     fullSync().catch(() => {});
   }
 
   async function saveNote() {
     const childId = appState.selectedChildId;
     if (!childId) return;
-    await setDayNote(childId, dateKey, noteText);
+    await setDayNote(childId, dateKey, noteText, appState.deviceCaregiverId);
     noteSaved = true;
     fullSync().catch(() => {});
   }
@@ -84,33 +155,78 @@
         <path d="M15 18l-6-6 6-6" stroke-linecap="round" stroke-linejoin="round" />
       </svg>
     </button>
-    <h1>{dateKey}</h1>
+    <div class="date-nav">
+      <button class="btn-icon small" aria-label="Previous day" onclick={() => (dateKey = shiftDay(-1))}>‹</button>
+      <h1>{dateKey}</h1>
+      <button class="btn-icon small" aria-label="Next day" onclick={() => (dateKey = shiftDay(1))}>›</button>
+    </div>
   </header>
 
   <TimelineBar segments={timeline} />
 
+  {#if recentlyDeleted.length > 0}
+    <div class="undo-list">
+      {#each recentlyDeleted as s (s.id)}
+        <div class="undo-row muted small">
+          <span>Removed a sleep entry ({new Date(s.startTime).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })})</span>
+          <button class="link" onclick={() => undoRemove(s.id)}>Undo</button>
+        </div>
+      {/each}
+    </div>
+  {/if}
+
   <section class="card log">
     {#if daySessions.length === 0}
-      <p class="muted">No sleep logged this day.</p>
+      <p class="muted">Nothing logged this day.</p>
     {:else}
       {#each daySessions as s (s.id)}
-        <div class="row">
-          <span>{formatRange(s.startTime, s.endTime)}</span>
-          <button class="btn-icon small" aria-label="Delete" onclick={() => removeSession(s.id)}>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13" stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
-          </button>
+        <div class="row-wrap">
+          {#if editingId === s.id}
+            <div class="edit-block">
+              <label>
+                Start
+                <input type="datetime-local" bind:value={editStart} />
+              </label>
+              {#if s.endTime}
+                <label>
+                  End
+                  <input type="datetime-local" bind:value={editEnd} />
+                </label>
+              {/if}
+              <div class="actions">
+                <button class="btn-secondary" onclick={() => (editingId = null)}>Cancel</button>
+                <button class="btn-primary" onclick={() => saveEdit(s)}>Save</button>
+              </div>
+            </div>
+          {:else}
+            <button class="row" onclick={() => startEdit(s)}>
+              <span>
+                <span class="slot-label muted">{SLOT_LABELS[slotBySessionId.get(s.id) as SleepSlot]}</span>
+                {formatRange(s.startTime, s.endTime)}
+                <span class="attribution faint"> · logged by {appState.caregiverName(s.loggedBy)}</span>
+              </span>
+            </button>
+            <button class="btn-icon small" aria-label="Delete" onclick={() => removeSession(s.id)}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+          {/if}
         </div>
       {/each}
     {/if}
   </section>
 
-  <section class="card">
-    <label class="toggle">
-      <input type="checkbox" checked={allExcluded} onchange={toggleExcludeAll} disabled={daySessions.length === 0} />
-      Exclude this day from predictions
-    </label>
+  <section class="card {allExcluded ? 'excluded' : ''}">
+    {#if allExcluded}
+      <button class="quiet-toggle muted" onclick={toggleExcludeAll} disabled={daySessions.length === 0}>
+        Not counted toward predictions · tap to include
+      </button>
+    {:else}
+      <button class="quiet-toggle" onclick={toggleExcludeAll} disabled={daySessions.length === 0}>
+        Exclude this day from predictions
+      </button>
+    {/if}
   </section>
 
   <section class="card note">
@@ -142,6 +258,13 @@
     align-items: center;
     gap: 12px;
   }
+  .date-nav {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1;
+    justify-content: center;
+  }
   h1 {
     font-size: 1.2rem;
     margin: 0;
@@ -151,19 +274,78 @@
     flex-direction: column;
     gap: 10px;
   }
+  .row-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
   .row {
+    flex: 1;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: transparent;
+    padding: 6px 0;
+    text-align: left;
+    min-height: 44px;
+  }
+  .slot-label {
+    font-size: 0.8rem;
+    margin-right: 6px;
+  }
+  .attribution {
+    font-size: 0.8rem;
+  }
+  .btn-icon.small {
+    width: 44px;
+    height: 44px;
+    font-size: 1.2rem;
+  }
+  .undo-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .undo-row {
     display: flex;
     justify-content: space-between;
     align-items: center;
   }
-  .btn-icon.small {
-    width: 30px;
-    height: 30px;
+  .link {
+    background: transparent;
+    padding: 4px;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    color: var(--accent);
   }
-  .toggle {
+  .edit-block {
     display: flex;
-    align-items: center;
-    gap: 10px;
+    flex-direction: column;
+    gap: 8px;
+    width: 100%;
+  }
+  .edit-block label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.85rem;
+  }
+  .edit-block .actions {
+    display: flex;
+    gap: 8px;
+  }
+  .edit-block .actions button {
+    flex: 1;
+  }
+  .quiet-toggle {
+    background: transparent;
+    padding: 0;
+    width: 100%;
+    text-align: left;
+    min-height: 44px;
+  }
+  .card.excluded {
+    opacity: 0.7;
   }
   .note {
     display: flex;

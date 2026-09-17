@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { appState } from "./lib/appState.svelte";
   import { startAutoSync } from "./lib/sync";
+  import CaregiverPicker from "./lib/CaregiverPicker.svelte";
   import AddChild from "./lib/AddChild.svelte";
   import Home from "./lib/Home.svelte";
   import AddPastSleep from "./lib/AddPastSleep.svelte";
@@ -16,6 +17,7 @@
   let loaded = $state(false);
 
   onMount(async () => {
+    await appState.loadCaregivers();
     await appState.loadChildren();
     loaded = true;
     startAutoSync();
@@ -24,6 +26,8 @@
 
 {#if !loaded}
   <div class="loading"></div>
+{:else if !appState.deviceCaregiverId}
+  <CaregiverPicker onDone={() => {}} />
 {:else if appState.children.length === 0}
   <AddChild onDone={() => {}} />
 {:else if view.name === "home"}

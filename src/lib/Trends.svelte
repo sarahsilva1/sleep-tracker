@@ -4,14 +4,18 @@
 
   let { onBack }: { onBack: () => void } = $props();
 
-  let stats7 = $derived(computeDailyStats(appState.selectedSessions, 7));
-  let stats14 = $derived(computeDailyStats(appState.selectedSessions, 14));
+  let stats7 = $derived(
+    appState.selectedChild ? computeDailyStats(appState.selectedSessions, appState.selectedChild, 7) : [],
+  );
+  let stats14 = $derived(
+    appState.selectedChild ? computeDailyStats(appState.selectedSessions, appState.selectedChild, 14) : [],
+  );
   let summary = $derived(summarize(stats7));
 
   let maxBar = $derived(Math.max(1, ...stats14.map((s) => s.totalMinutes / 60)));
 
   function fmt(n: number | null, unit: string): string {
-    return n === null ? "—" : `${n.toFixed(1)} ${unit}`;
+    return n === null ? "—" : `${n.toFixed(1)}${unit ? " " + unit : ""}`;
   }
 </script>
 
@@ -39,31 +43,38 @@
       {/each}
     </div>
 
-    <section class="card stats">
-      <div class="stat">
-        <span class="muted small">Avg total sleep/day this week</span>
-        <span class="value">{fmt(summary.avgTotalHours, "hrs")}</span>
-      </div>
-      <div class="stat">
-        <span class="muted small">Avg longest stretch this week</span>
-        <span class="value">{fmt(summary.avgLongestHours, "hrs")}</span>
-      </div>
-      <div class="stat">
-        <span class="muted small">Avg sleep sessions/day this week</span>
-        <span class="value">{fmt(summary.avgSessionsPerDay, "")}</span>
-      </div>
-    </section>
+    {#if summary.daysWithData === 0}
+      <p class="muted">
+        Still getting to know {appState.selectedChild.name}'s rhythm — trends will appear once a few sleeps are
+        logged.
+      </p>
+    {:else}
+      <section class="card stats">
+        <div class="stat">
+          <span class="muted small">Avg night sleep this week</span>
+          <span class="value">{fmt(summary.avgNightHours, "hrs")}</span>
+        </div>
+        <div class="stat">
+          <span class="muted small">Avg total sleep/day this week</span>
+          <span class="value">{fmt(summary.avgTotalHours, "hrs")}</span>
+        </div>
+        <div class="stat">
+          <span class="muted small">Avg naps/day this week</span>
+          <span class="value">{fmt(summary.avgNapsPerDay, "")}</span>
+        </div>
+      </section>
 
-    <section class="card">
-      <span class="muted small">Total sleep, last 14 days</span>
-      <div class="sparkline">
-        {#each stats14 as day (day.dateKey)}
-          <div class="bar-wrap" title="{day.dateKey}: {(day.totalMinutes / 60).toFixed(1)}h">
-            <div class="bar" style="height: {(day.totalMinutes / 60 / maxBar) * 100}%"></div>
-          </div>
-        {/each}
-      </div>
-    </section>
+      <section class="card">
+        <span class="muted small">Total sleep, last 14 days</span>
+        <div class="sparkline">
+          {#each stats14 as day (day.dateKey)}
+            <div class="bar-wrap" title="{day.dateKey}: {(day.totalMinutes / 60).toFixed(1)}h">
+              <div class="bar" style="height: {(day.totalMinutes / 60 / maxBar) * 100}%"></div>
+            </div>
+          {/each}
+        </div>
+      </section>
+    {/if}
   {/if}
 </div>
 

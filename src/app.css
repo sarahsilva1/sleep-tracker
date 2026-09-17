@@ -7,7 +7,7 @@
 
   --text: #f3e9dc;
   --text-muted: #b7a795;
-  --text-faint: #8a7a68;
+  --text-faint: #a08e7a;
 
   --accent: #d98554;
   --accent-strong: #e6935f;
@@ -62,6 +62,20 @@ button {
   border: none;
   cursor: pointer;
   color: inherit;
+  min-height: 44px;
+  min-width: 44px;
+  transition:
+    background-color 0.2s ease,
+    opacity 0.2s ease,
+    transform 0.15s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
 }
 
 input,
@@ -123,8 +137,8 @@ textarea:focus {
 .btn-icon {
   background: var(--surface);
   border-radius: 999px;
-  width: 40px;
-  height: 40px;
+  width: 44px;
+  height: 44px;
   display: flex;
   align-items: center;
   justify-content: center;

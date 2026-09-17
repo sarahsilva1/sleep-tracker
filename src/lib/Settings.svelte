@@ -1,51 +1,141 @@
 <script lang="ts">
   import { appState } from "./appState.svelte";
-  import { getOverride, setOverride, clearOverride } from "./db";
-  import { exportCsv, exportJson } from "./exportData";
+  import {
+    updateChild,
+    setChildHidden,
+    listChildren,
+    createCaregiver,
+    updateCaregiver,
+    removeCaregiver,
+    setDeviceCaregiverId,
+    MAX_CAREGIVERS,
+    MAX_CHILDREN,
+  } from "./db";
+  import { exportCsv, exportJson, importJson } from "./exportData";
   import { syncConfigured } from "./supabaseClient";
-  import { createFamilyAndGetSetupCode, joinFamilyWithSetupCode, hasJoinedFamily, leaveFamily, fullSync } from "./sync";
+  import {
+    createFamilyAndGetSetupCode,
+    joinFamilyWithSetupCode,
+    mintAdditionalSetupCode,
+    hasJoinedFamily,
+    leaveFamily,
+    fullSync,
+  } from "./sync";
   import AddChild from "./AddChild.svelte";
-  import type { SleepSlot } from "./types";
+  import HuckleberryImport from "./HuckleberryImport.svelte";
+  import type { Child } from "./types";
 
   let { onBack }: { onBack: () => void } = $props();
 
-  const SLOTS: { key: SleepSlot; label: string }[] = [
-    { key: "nap1", label: "Nap 1" },
-    { key: "nap2", label: "Nap 2" },
-    { key: "nap3", label: "Nap 3" },
-    { key: "bedtime", label: "Bedtime" },
-  ];
-
-  let overridesByChild = $state<Record<string, Record<string, number | undefined>>>({});
   let showAddChild = $state(false);
+  let showHiddenChildren = $state(false);
+  let hiddenChildren = $state<Child[]>([]);
+  let editingChildId = $state<string | null>(null);
+  let editDraft = $state<Partial<Child>>({});
+  let showHuckleberry = $state(false);
 
+  async function refreshHidden() {
+    const all = await listChildren(true);
+    hiddenChildren = all.filter((c) => c.hidden);
+  }
   $effect(() => {
-    (async () => {
-      const result: Record<string, Record<string, number | undefined>> = {};
-      for (const child of appState.children) {
-        result[child.id] = {};
-        for (const slot of SLOTS) {
-          const o = await getOverride(child.id, slot.key);
-          result[child.id][slot.key] = o?.wakeWindowMinutes;
-        }
-      }
-      overridesByChild = result;
-    })();
+    if (showHiddenChildren) refreshHidden();
   });
 
-  async function updateOverride(childId: string, slot: SleepSlot, value: string) {
-    if (value === "") {
-      await clearOverride(childId, slot);
-    } else {
-      const minutes = Number(value);
-      if (!Number.isFinite(minutes) || minutes <= 0) return;
-      await setOverride(childId, slot, minutes);
-    }
-    overridesByChild = {
-      ...overridesByChild,
-      [childId]: { ...overridesByChild[childId], [slot]: value === "" ? undefined : Number(value) },
-    };
+  function startEditChild(child: Child) {
+    editingChildId = child.id;
+    editDraft = { ...child };
   }
+
+  async function saveChildEdit() {
+    if (!editingChildId) return;
+    await updateChild(editingChildId, {
+      name: editDraft.name,
+      dateOfBirth: editDraft.dateOfBirth,
+      avatar: editDraft.avatar || null,
+      typicalBedtime: editDraft.typicalBedtime,
+      typicalWakeTime: editDraft.typicalWakeTime,
+      typicalNapCount: Number(editDraft.typicalNapCount),
+    });
+    await appState.loadChildren();
+    editingChildId = null;
+  }
+
+  async function hideChild(id: string) {
+    if (!confirm("Hide this child? Their sleep data is kept and they can be shown again anytime.")) return;
+    await setChildHidden(id, true);
+    await appState.loadChildren();
+  }
+
+  async function unhideChild(id: string) {
+    await setChildHidden(id, false);
+    await appState.loadChildren();
+    await refreshHidden();
+  }
+
+  // --- Caregivers ---
+
+  let newCaregiverName = $state("");
+  let addingCaregiver = $state(false);
+  let renamingId = $state<string | null>(null);
+  let renameValue = $state("");
+
+  async function addCaregiver() {
+    if (!newCaregiverName.trim() || addingCaregiver) return;
+    addingCaregiver = true;
+    await createCaregiver(newCaregiverName.trim());
+    await appState.loadCaregivers();
+    newCaregiverName = "";
+    addingCaregiver = false;
+  }
+
+  function switchTo(id: string) {
+    setDeviceCaregiverId(id);
+    appState.deviceCaregiverId = id;
+  }
+
+  function startRename(id: string, current: string) {
+    renamingId = id;
+    renameValue = current;
+  }
+
+  async function saveRename() {
+    if (!renamingId || !renameValue.trim()) return;
+    await updateCaregiver(renamingId, { firstName: renameValue.trim() });
+    await appState.loadCaregivers();
+    renamingId = null;
+  }
+
+  async function deleteCaregiver(id: string) {
+    if (!confirm("Remove this caregiver? Past entries stay, shown as logged by a removed caregiver.")) return;
+    await removeCaregiver(id);
+    await appState.loadCaregivers();
+  }
+
+  // --- Import ---
+
+  let importError = $state("");
+  let importSummary = $state("");
+
+  async function onImportFile(e: Event) {
+    importError = "";
+    importSummary = "";
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const result = await importJson(text);
+      await appState.loadChildren();
+      await appState.loadCaregivers();
+      importSummary = `Imported ${result.childrenAdded} children, ${result.caregiversAdded} caregivers, ${result.sessionsAdded} sleep sessions, ${result.notesAdded} notes.`;
+    } catch (err: any) {
+      importError = err?.message ?? "Import failed — is this a SweetSpot JSON export?";
+    }
+    input.value = "";
+  }
+
+  // --- Sync ---
 
   let syncBusy = $state(false);
   let syncError = $state("");
@@ -73,13 +163,27 @@
       joined = true;
       await fullSync();
     } catch (e: any) {
-      syncError = e?.message ?? "Invalid setup code.";
+      syncError = e?.message ?? "Invalid or expired setup code.";
+    }
+    syncBusy = false;
+  }
+
+  async function generateAnotherCode() {
+    syncError = "";
+    syncBusy = true;
+    try {
+      generatedCode = await mintAdditionalSetupCode();
+    } catch (e: any) {
+      syncError = e?.message ?? "Failed to create a new code.";
     }
     syncBusy = false;
   }
 
   function disconnectSync() {
-    if (!confirm("Stop syncing this device? Local data stays, but it will no longer share with the other caregiver.")) return;
+    if (
+      !confirm("Stop syncing this device? Local data stays, but it will no longer share with other caregivers.")
+    )
+      return;
     leaveFamily();
     joined = false;
     generatedCode = "";
@@ -99,41 +203,89 @@
   <section class="card">
     <h2>Children</h2>
     {#each appState.children as child (child.id)}
-      <div class="row">
-        <span>{child.name}</span>
-        <span class="muted small">{child.dateOfBirth}</span>
-      </div>
+      {#if editingChildId === child.id}
+        <div class="edit-child">
+          <label>Name <input type="text" bind:value={editDraft.name} /></label>
+          <label>Date of birth <input type="date" bind:value={editDraft.dateOfBirth} /></label>
+          <label>Avatar (emoji or initials) <input type="text" bind:value={editDraft.avatar} maxlength="4" /></label>
+          <label>Typical bedtime <input type="time" bind:value={editDraft.typicalBedtime} /></label>
+          <label>Typical wake time <input type="time" bind:value={editDraft.typicalWakeTime} /></label>
+          <label>
+            Typical naps per day
+            <input type="number" min="0" max="4" bind:value={editDraft.typicalNapCount} />
+          </label>
+          <div class="actions">
+            <button class="btn-secondary" onclick={() => (editingChildId = null)}>Cancel</button>
+            <button class="btn-primary" onclick={saveChildEdit}>Save</button>
+          </div>
+          <button class="btn-secondary hide-btn" onclick={() => hideChild(child.id)}>Hide this child</button>
+        </div>
+      {:else}
+        <button class="row" onclick={() => startEditChild(child)}>
+          <span>{child.avatar ?? child.name.slice(0, 1).toUpperCase()} {child.name}</span>
+          <span class="muted small">{child.dateOfBirth}</span>
+        </button>
+      {/if}
     {/each}
-    {#if appState.children.length < 2}
+
+    {#if hiddenChildren.length > 0 || showHiddenChildren}
+      <button class="link muted small" onclick={() => (showHiddenChildren = !showHiddenChildren)}>
+        {showHiddenChildren ? "Hide" : "Show"} hidden children
+      </button>
+      {#if showHiddenChildren}
+        {#each hiddenChildren as child (child.id)}
+          <div class="row hidden-row">
+            <span class="muted">{child.avatar ?? child.name.slice(0, 1).toUpperCase()} {child.name}</span>
+            <button class="btn-secondary" onclick={() => unhideChild(child.id)}>Unhide</button>
+          </div>
+        {/each}
+      {/if}
+    {/if}
+
+    {#if appState.children.length < MAX_CHILDREN}
       {#if showAddChild}
         <AddChild onDone={() => (showAddChild = false)} />
       {:else}
-        <button class="btn-secondary" onclick={() => (showAddChild = true)}>+ Add second child</button>
+        <button class="btn-secondary" onclick={() => (showAddChild = true)}>+ Add child</button>
       {/if}
     {/if}
   </section>
 
   <section class="card">
-    <h2>SweetSpot overrides</h2>
-    <p class="muted small">Leave blank to use the automatic prediction.</p>
-    {#each appState.children as child (child.id)}
-      <div class="child-overrides">
-        <span class="muted small">{child.name}</span>
-        {#each SLOTS as slot (slot.key)}
-          <label class="override-row">
-            {slot.label}
-            <input
-              type="number"
-              min="1"
-              placeholder="auto"
-              value={overridesByChild[child.id]?.[slot.key] ?? ""}
-              onchange={(e) => updateOverride(child.id, slot.key, (e.target as HTMLInputElement).value)}
-            />
-            <span class="muted small">min</span>
-          </label>
-        {/each}
-      </div>
+    <h2>Caregivers</h2>
+    {#each appState.caregivers as caregiver (caregiver.id)}
+      {#if renamingId === caregiver.id}
+        <div class="row">
+          <input type="text" bind:value={renameValue} />
+          <button class="btn-secondary" onclick={saveRename}>Save</button>
+        </div>
+      {:else}
+        <div class="row">
+          <span>
+            {caregiver.avatar ?? caregiver.firstName.slice(0, 1).toUpperCase()}
+            {caregiver.firstName}
+            {#if caregiver.id === appState.deviceCaregiverId}<span class="muted small">(this device)</span>{/if}
+          </span>
+          <span class="row-actions">
+            {#if caregiver.id !== appState.deviceCaregiverId}
+              <button class="btn-secondary" onclick={() => switchTo(caregiver.id)}>Switch to</button>
+            {/if}
+            <button class="btn-icon small" aria-label="Rename" onclick={() => startRename(caregiver.id, caregiver.firstName)}>
+              ✎
+            </button>
+            <button class="btn-icon small" aria-label="Remove" onclick={() => deleteCaregiver(caregiver.id)}>×</button>
+          </span>
+        </div>
+      {/if}
     {/each}
+    {#if appState.caregivers.length < MAX_CAREGIVERS}
+      <div class="row">
+        <input type="text" placeholder="Add a caregiver" bind:value={newCaregiverName} />
+        <button class="btn-secondary" disabled={!newCaregiverName.trim() || addingCaregiver} onclick={addCaregiver}>
+          Add
+        </button>
+      </div>
+    {/if}
   </section>
 
   <section class="card">
@@ -142,6 +294,17 @@
       <button class="btn-secondary" onclick={exportCsv}>Export CSV</button>
       <button class="btn-secondary" onclick={exportJson}>Export JSON</button>
     </div>
+  </section>
+
+  <section class="card">
+    <h2>Import data</h2>
+    <label>
+      Restore from a SweetSpot JSON backup
+      <input type="file" accept="application/json" onchange={onImportFile} />
+    </label>
+    {#if importSummary}<p class="muted small">{importSummary}</p>{/if}
+    {#if importError}<p class="error">{importError}</p>{/if}
+    <button class="btn-secondary" onclick={() => (showHuckleberry = true)}>One-time Huckleberry import</button>
   </section>
 
   <section class="card">
@@ -154,15 +317,17 @@
         <div class="code-display">
           <span class="code">{generatedCode}</span>
           <p class="muted small">
-            Read this code to your co-parent to enter on their device. It won't be shown again — write it down if
-            needed.
+            Read this code to the next caregiver to enter on their device — it expires in 30 minutes and works once.
           </p>
         </div>
       {/if}
       <div class="actions">
         <button class="btn-secondary" onclick={() => fullSync()}>Sync now</button>
-        <button class="btn-secondary" onclick={disconnectSync}>Stop syncing</button>
+        <button class="btn-secondary" disabled={syncBusy} onclick={generateAnotherCode}>
+          Invite another device
+        </button>
       </div>
+      <button class="btn-secondary" onclick={disconnectSync}>Stop syncing</button>
     {:else}
       <div class="sync-setup">
         <button class="btn-secondary" disabled={syncBusy} onclick={createSync}>Create sync code</button>
@@ -177,6 +342,10 @@
     {/if}
   </section>
 </div>
+
+{#if showHuckleberry}
+  <HuckleberryImport onDone={() => (showHuckleberry = false)} />
+{/if}
 
 <style>
   .settings {
@@ -206,21 +375,41 @@
   .row {
     display: flex;
     justify-content: space-between;
+    align-items: center;
+    background: transparent;
+    padding: 8px 0;
+    text-align: left;
+    min-height: 44px;
+    width: 100%;
   }
-  .child-overrides {
+  .row-actions {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+  .hidden-row {
+    opacity: 0.7;
+  }
+  .edit-child {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 0;
+  }
+  .edit-child label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.85rem;
+  }
+  .hide-btn {
+    color: var(--danger);
+  }
+  label {
     display: flex;
     flex-direction: column;
     gap: 6px;
-    padding-bottom: 8px;
-  }
-  .override-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
     font-size: 0.9rem;
-  }
-  .override-row input {
-    width: 70px;
   }
   .actions {
     display: flex;
@@ -228,6 +417,13 @@
   }
   .actions button {
     flex: 1;
+  }
+  .link {
+    background: transparent;
+    padding: 4px 0;
+    text-align: left;
+    text-decoration: underline;
+    text-underline-offset: 2px;
   }
   .code-display {
     text-align: center;
@@ -254,5 +450,10 @@
     color: var(--danger);
     font-size: 0.85rem;
     margin: 0;
+  }
+  .btn-icon.small {
+    width: 44px;
+    height: 44px;
+    font-size: 1rem;
   }
 </style>

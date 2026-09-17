@@ -1,11 +1,11 @@
 <script lang="ts">
   import { appState } from "./appState.svelte";
-  import { startSleepSession, endSleepSession, getRunningSession, getOverride } from "./db";
-  import { predictNextSleep, type SweetSpotPrediction } from "./prediction";
+  import { startSleepSession, endSleepSession, getRunningSession, updateSleepSession } from "./db";
+  import { predictWindDown, predictEstimatedWake, type WindDownPrediction, type EstimatedWakeRange } from "./prediction";
   import { buildDayTimeline, todayKey } from "./timeline";
   import TimelineBar from "./TimelineBar.svelte";
   import { fullSync } from "./sync";
-  import type { SleepSlot } from "./types";
+  import { timeAwareGreeting } from "./greeting";
 
   let {
     onOpenTrends,
@@ -20,108 +20,142 @@
   } = $props();
 
   let now = $state(new Date());
-  let overrides = $state<Map<SleepSlot, number>>(new Map());
   let toggling = $state(false);
+  let confirmMessage = $state("");
+  let editingStart = $state(false);
+  let editStartValue = $state("");
 
   $effect(() => {
     const interval = setInterval(() => (now = new Date()), 1000);
     return () => clearInterval(interval);
   });
 
-  $effect(() => {
-    const childId = appState.selectedChildId;
-    if (!childId) return;
-    (async () => {
-      const slots: SleepSlot[] = ["nap1", "nap2", "nap3", "bedtime"];
-      const map = new Map<SleepSlot, number>();
-      for (const slot of slots) {
-        const o = await getOverride(childId, slot);
-        if (o) map.set(slot, o.wakeWindowMinutes);
-      }
-      overrides = map;
-    })();
-  });
-
   let runningSession = $derived(appState.selectedSessions.find((s) => s.endTime === null) ?? null);
 
-  let prediction = $derived.by((): SweetSpotPrediction | null => {
+  let windDown = $derived.by((): WindDownPrediction | null => {
     if (!appState.selectedChild || runningSession) return null;
-    return predictNextSleep(appState.selectedChild, appState.selectedSessions, overrides, now);
+    return predictWindDown(appState.selectedChild, appState.selectedSessions, now);
   });
 
-  let countdownText = $derived.by(() => {
-    if (!prediction) return null;
-    const diffMs = prediction.predictedTime.getTime() - now.getTime();
-    const diffMin = Math.round(diffMs / 60000);
-    if (diffMin <= 0) return "now";
-    const h = Math.floor(diffMin / 60);
-    const m = diffMin % 60;
-    return h > 0 ? `${h}h ${m}m` : `${m}m`;
+  let estimatedWake = $derived.by((): EstimatedWakeRange | null => {
+    if (!appState.selectedChild || !runningSession) return null;
+    return predictEstimatedWake(appState.selectedChild, appState.selectedSessions, now);
+  });
+
+  function formatDurationWords(totalMinutes: number): string {
+    const mins = Math.max(0, Math.round(totalMinutes));
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    if (h === 0) return `${m} minute${m === 1 ? "" : "s"}`;
+    if (m === 0) return `${h} hour${h === 1 ? "" : "s"}`;
+    return `${h}h ${m}m`;
+  }
+
+  function formatTime(d: Date): string {
+    return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  }
+
+  let windDownPhrase = $derived.by(() => {
+    if (!windDown) return null;
+    const diffMin = (windDown.predictedTime.getTime() - now.getTime()) / 60000;
+    if (diffMin <= 0) return `Wind-down time was ${formatTime(windDown.predictedTime)}`;
+    if (diffMin <= 5) return "Time to wind down";
+    return `Wind down in ${formatDurationWords(diffMin)}, at ${formatTime(windDown.predictedTime)}`;
   });
 
   let elapsedAsleepText = $derived.by(() => {
     if (!runningSession) return null;
-    const diffMin = Math.round((now.getTime() - new Date(runningSession.startTime).getTime()) / 60000);
-    const h = Math.floor(diffMin / 60);
-    const m = diffMin % 60;
-    return h > 0 ? `${h}h ${m}m` : `${m}m`;
+    return formatDurationWords((now.getTime() - new Date(runningSession.startTime).getTime()) / 60000);
   });
 
   let timeline = $derived(
     appState.selectedChildId ? buildDayTimeline(todayKey(now), appState.selectedSessions, now) : [],
   );
 
+  let hasEverSlept = $derived(appState.selectedSessions.length > 0);
+
   function isAsleep(childId: string): boolean {
     return (appState.sessionsByChild[childId] ?? []).some((s) => s.endTime === null);
+  }
+
+  function avatarFor(child: { avatar: string | null; name: string }): string {
+    return child.avatar ?? child.name.slice(0, 1).toUpperCase();
   }
 
   async function toggleSleep() {
     if (!appState.selectedChildId || toggling) return;
     toggling = true;
     const childId = appState.selectedChildId;
+    const childName = appState.selectedChild?.name ?? "";
     const running = await getRunningSession(childId);
     if (running) {
       await endSleepSession(running.id);
     } else {
-      await startSleepSession(childId);
+      await startSleepSession(childId, appState.deviceCaregiverId);
+      confirmMessage = `Got it. Sleep well, ${childName}.`;
+      setTimeout(() => (confirmMessage = ""), 3000);
     }
     await appState.loadSessions(childId);
     toggling = false;
     fullSync().catch(() => {});
   }
 
-  function formatTime(d: Date): string {
-    return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  function startEditingTime() {
+    if (!runningSession) return;
+    const d = new Date(runningSession.startTime);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    editStartValue = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    editingStart = true;
+  }
+
+  async function saveEditedTime() {
+    if (!runningSession || !appState.selectedChildId) return;
+    const newStart = new Date(editStartValue);
+    if (newStart <= new Date()) {
+      await updateSleepSession(runningSession.id, { startTime: newStart.toISOString() });
+      await appState.loadSessions(appState.selectedChildId);
+      fullSync().catch(() => {});
+    }
+    editingStart = false;
   }
 </script>
 
 <div class="home">
   <header>
-    <div class="pills">
+    <div class="top-row">
+      {#if appState.deviceCaregiver}
+        <p class="greeting muted">{timeAwareGreeting(appState.deviceCaregiver.firstName, now)}</p>
+      {/if}
+      <div class="icon-row">
+        <button class="btn-icon" aria-label="Trends" onclick={onOpenTrends}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M4 19V10M12 19V5M20 19v-7" stroke-linecap="round" />
+          </svg>
+        </button>
+        <button class="btn-icon" aria-label="Settings" onclick={onOpenSettings}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3" />
+            <path
+              d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"
+            />
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="pills {appState.children.length > 2 ? 'compact' : ''}">
       {#each appState.children as child (child.id)}
         <button
-          class="pill {child.id === appState.selectedChildId ? 'active' : ''}"
+          class="pill {child.id === appState.selectedChildId ? 'active' : ''} {appState.children.length > 2 ? 'compact' : ''}"
           onclick={() => appState.selectChild(child.id)}
         >
+          <span class="avatar">{avatarFor(child)}</span>
           <span class="status-dot {isAsleep(child.id) ? 'asleep' : 'awake'}"></span>
-          {child.name}
+          {#if appState.children.length <= 2 || child.id === appState.selectedChildId}
+            <span>{child.name}</span>
+          {/if}
         </button>
       {/each}
-    </div>
-    <div class="icon-row">
-      <button class="btn-icon" aria-label="Trends" onclick={onOpenTrends}>
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M4 19V10M12 19V5M20 19v-7" stroke-linecap="round" />
-        </svg>
-      </button>
-      <button class="btn-icon" aria-label="Settings" onclick={onOpenSettings}>
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="12" cy="12" r="3" />
-          <path
-            d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"
-          />
-        </svg>
-      </button>
     </div>
   </header>
 
@@ -132,23 +166,54 @@
       {#if runningSession}
         <div class="label muted">Asleep for</div>
         <div class="big">{elapsedAsleepText}</div>
-        <div class="muted small">since {formatTime(new Date(runningSession.startTime))}</div>
-      {:else if prediction}
-        <div class="label muted">Next SweetSpot</div>
-        <div class="big">{formatTime(prediction.predictedTime)}</div>
-        <div class="muted small">in {countdownText}</div>
-      {:else}
-        <div class="label muted">Next SweetSpot</div>
-        <div class="big faint">—</div>
+        {#if editingStart}
+          <div class="edit-row">
+            <input type="datetime-local" bind:value={editStartValue} />
+            <button class="btn-secondary" onclick={saveEditedTime}>Save</button>
+          </div>
+        {:else}
+          <button class="muted small link" onclick={startEditingTime}>
+            since {formatTime(new Date(runningSession.startTime))} · tap to adjust
+          </button>
+        {/if}
+        {#if estimatedWake}
+          <div class="estimate muted">
+            Probably up around {formatTime(estimatedWake.rangeStart)}–{formatTime(estimatedWake.rangeEnd)} — just an
+            estimate
+          </div>
+        {/if}
+      {:else if windDownPhrase}
+        <div class="big wind-down">{windDownPhrase}</div>
+        {#if windDown && windDown.daysOfData < 3}
+          <div class="muted small">
+            Still getting to know {appState.selectedChild.name}'s rhythm — predictions will sharpen as more sleeps are
+            logged.
+          </div>
+        {/if}
+      {:else if !hasEverSlept}
+        <div class="muted">Nothing logged yet today — tap below whenever you're ready.</div>
       {/if}
     </div>
 
+    {#if confirmMessage}
+      <p class="confirm muted">{confirmMessage}</p>
+    {/if}
+
     <div class="main-action">
-      <button
-        class="btn-primary {runningSession ? 'active' : ''}"
-        disabled={toggling}
-        onclick={toggleSleep}
-      >
+      <button class="btn-primary icon-label {runningSession ? 'active' : ''}" disabled={toggling} onclick={toggleSleep}>
+        {#if runningSession}
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="4" />
+            <path
+              d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"
+              stroke-linecap="round"
+            />
+          </svg>
+        {:else}
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+            <path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5Z" />
+          </svg>
+        {/if}
         {runningSession ? "Wake Up" : "Log Sleep"}
       </button>
       <button class="btn-icon" aria-label="Add past sleep" onclick={onAddPastSleep}>
@@ -170,24 +235,58 @@
     padding: 20px;
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    gap: 16px;
   }
   header {
     display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .top-row {
+    display: flex;
     justify-content: space-between;
     align-items: center;
+    min-height: 20px;
+  }
+  .greeting {
+    font-size: 0.9rem;
+    margin: 0;
   }
   .pills {
     display: flex;
     gap: 8px;
   }
+  .pills.compact {
+    gap: 6px;
+  }
   .icon-row {
     display: flex;
     gap: 8px;
   }
+  .avatar {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--surface-2);
+    font-size: 0.75rem;
+  }
+  .pill {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .pill.compact {
+    padding: 8px 10px;
+  }
   .sweetspot {
     text-align: center;
     padding: 28px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
   }
   .label {
     font-size: 0.85rem;
@@ -195,13 +294,41 @@
     letter-spacing: 0.04em;
   }
   .big {
-    font-size: 2.6rem;
+    font-size: 1.8rem;
     font-weight: 700;
-    line-height: 1.2;
-    margin: 4px 0;
+    line-height: 1.3;
+  }
+  .big.wind-down {
+    font-size: 1.5rem;
   }
   .small {
     font-size: 0.85rem;
+  }
+  .estimate {
+    font-size: 0.85rem;
+  }
+  .confirm {
+    text-align: center;
+    margin: 0;
+    font-size: 0.9rem;
+    transition: opacity 0.3s ease;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .confirm {
+      transition: none;
+    }
+  }
+  .link {
+    background: transparent;
+    padding: 4px;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .edit-row {
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+    align-items: center;
   }
   .main-action {
     display: flex;
@@ -211,6 +338,12 @@
   .main-action .btn-primary {
     flex: 1;
     text-align: center;
+  }
+  .icon-label {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
   }
   .main-action .btn-primary:disabled {
     opacity: 0.6;

@@ -47,7 +47,7 @@
       return;
     }
     saving = true;
-    await addPastSleepSession(childId, startDate.toISOString(), endDate.toISOString());
+    await addPastSleepSession(childId, appState.deviceCaregiverId, startDate.toISOString(), endDate.toISOString());
     await appState.loadSessions(childId);
     saving = false;
     fullSync().catch(() => {});

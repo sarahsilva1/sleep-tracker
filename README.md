@@ -1,8 +1,8 @@
 # SweetSpot
 
 A fast, ad-free PWA for tracking baby/toddler sleep and predicting the next
-ideal sleep time. Local-first, private, and built for two caregivers sharing
-one or two children's data — no accounts, no ads, no clutter.
+wind-down time. Local-first, private, and built for up to four caregivers
+sharing up to four children's data — no accounts, no ads, no clutter.
 
 ## Stack
 
@@ -59,10 +59,24 @@ GitHub Actions** enabled on the repo, and serves from
 
 ## Data model
 
-- **Child**: id, name, date of birth
+- **Child**: id, name, date of birth, avatar, typical bedtime/wake time,
+  typical nap count, hidden flag (children are hidden, never deleted)
+- **Caregiver**: id, first name, avatar — identity by convention (which
+  device is acting as whom), not authentication
 - **SleepSession**: id, child id, start time, end time (nullable while
-  running), excluded flag
-- **DayNote**: child id, date, free-text note
+  running), excluded flag, logged-by caregiver, soft-delete timestamp
+- **DayNote**: child id, date, free-text note, author caregiver
 
 All timestamps are stored in UTC; local timezone is used only for display
-and for grouping sessions into calendar days.
+and for classifying sessions as night sleep vs. naps (via each child's own
+bedtime/wake window) and grouping them into calendar days.
+
+## Sync pairing hardening
+
+Setup codes expire after 30 minutes and can only be redeemed once; an
+already-joined device can mint additional codes (Settings → "Invite another
+device") to pair a 3rd/4th caregiver without creating a second family.
+Redemption is rate-limited server-side (10 attempts / 15 min per device).
+If every device ever loses its local session simultaneously, the family
+becomes unreachable — there's no recovery code — so treat regular CSV/JSON
+export as your backup path, not just a nice-to-have.

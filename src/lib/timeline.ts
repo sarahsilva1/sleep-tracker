@@ -14,7 +14,7 @@ export function buildDayTimeline(dateKey: string, sessions: SleepSession[], unti
   if (totalMs <= 0) return [];
 
   const relevant = sessions
-    .filter((s) => !s.deleted)
+    .filter((s) => !s.deletedAt)
     .map((s) => ({
       start: new Date(s.startTime),
       end: s.endTime ? new Date(s.endTime) : until,
